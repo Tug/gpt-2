@@ -3,7 +3,7 @@ import numpy as np
 import os
 import tensorflow as tf
 import tqdm
-
+import gzip
 
 def load_dataset(enc, path, combine):
     paths = []
@@ -83,91 +83,94 @@ class Sampler(object):
                 return self.chunks[i][within_chunk:within_chunk + length]
 
 def contbyte(b):
-  n = ord(b)
-  # https://en.wikipedia.org/wiki/UTF-8#Description
-  return n & (1 << 7) and not n & (1 << 6)
+    n = ord(b)
+    # https://en.wikipedia.org/wiki/UTF-8#Description
+    return n & (1 << 7) and not n & (1 << 6)
 
 def nextchar(f):
-  b = f.read(1)
-  # skip leading continuation bytes
-  while b and contbyte(b):
     b = f.read(1)
-  # append up to three continuation bytes
-  for _ in range(3):
-    c = f.read(1)
-    if c and contbyte(c):
-      b += c
-    elif c:
-      # not a continuation byte; back up one character
-      f.seek(-1, 1)
-      break
-  return b.decode('utf-8')
+    # skip leading continuation bytes
+    while b and contbyte(b):
+        b = f.read(1)
+    # append up to three continuation bytes
+    for _ in range(3):
+        c = f.read(1)
+        if c and contbyte(c):
+            b += c
+        elif c:
+            # not a continuation byte; back up one character
+            f.seek(-1, 1)
+            break
+    return b.decode('utf-8')
 
 def nextchars(f, n):
-  s = []
-  i = 0
-  while i < n:
-    c = nextchar(f)
-    if c is None:
-      break
-    if c != u'\r':
-      s.append(c)
-      i += 1
-  if len(s) > 0:
-    return ''.join(s)
+    s = []
+    i = 0
+    while i < n:
+        c = nextchar(f)
+        if c is None:
+            break
+        if c != u'\r':
+            s.append(c)
+            i += 1
+    if len(s) > 0:
+        return ''.join(s)
 
 def grab_tokens(f, enc, n):
-  n += 4
-  count = n
-  line = nextchars(f, count)
-  if not line:
-    return [], None
-  tokens = enc.encode(line)
-  while len(tokens) < n:
-    count *= 2
-    l = nextchars(f, count)
-    if not l:
-      break
-    line += l
+    n += 4
+    count = n
+    line = nextchars(f, count)
+    if not line:
+        return [], None
     tokens = enc.encode(line)
-  # skip the first couple tokens in case we started in the middle of a
-  # word (which is the likely case for a random seek anywhere in the
-  # dataset).
-  return tokens[3:], line
+    while len(tokens) < n:
+        count *= 2
+        l = nextchars(f, count)
+        if not l:
+            break
+        line += l
+        tokens = enc.encode(line)
+    # skip the first couple tokens in case we started in the middle of a
+    # word (which is the likely case for a random seek anywhere in the
+    # dataset).
+    return tokens[3:], line
 
 import threading
 
 class TextSampler(object):
-  def __init__(self, fp, enc, seed=None, verbose=False, use_locking=False):
-    if isinstance(fp, str):
-      fp = open(fp, 'rb')
-    self.fp = fp
-    fp.seek(0, 2)
-    self.total_size = fp.tell()
-    self.rs = np.random.RandomState(seed=seed)
-    self.enc = enc
-    self.verbose = verbose
-    self.lock = threading.Lock() if use_locking else None
-
-  def sample(self, length):
-    try:
-      if self.lock:
-        self.lock.acquire()
-      attempts = 0
-      while True:
-        attempts += 1
-        if attempts > 10:
-          print('Could not sample from dataset; too small?')
-          return None
-        index = self.rs.randint(0, self.total_size)
-        self.fp.seek(index, 0)
-        tokens, line = grab_tokens(self.fp, self.enc, length)
-        if len(tokens) >= length:
-          if self.verbose:
-            line = self.enc.decode(tokens)
-            print(repr(line))
-          return tokens[0:length]
-    finally:
-      if self.lock:
-        self.lock.release()
-
+    def __init__(self, fp, enc, seed=None, verbose=False, use_locking=False):
+        if isinstance(fp, str):
+            if fp.endswith('.gz'):
+                fp = gzip.open(fp, 'rb')
+            else:
+                fp = open(fp, 'rb')
+        self.fp = fp
+        fp.seek(0, 2)
+        self.total_size = fp.tell()
+        self.enc = enc
+        self.verbose = verbose
+        if self.verbose:
+            print( 'total file size: %d' % ( self.total_size ) )
+        self.rs = np.random.RandomState(seed=seed)
+        self.lock = threading.Lock() if use_locking else None
+    def sample(self, length):
+        try:
+            if self.lock:
+                self.lock.acquire()
+            attempts = 0
+            while True:
+                attempts += 1
+                if attempts > 10:
+                    print('Could not sample from dataset; too small?')
+                    return None
+                index = self.rs.randint(0, self.total_size)
+                self.fp.seek(index, 0)
+                tokens, line = grab_tokens(self.fp, self.enc, length)
+                if len(tokens) >= length:
+                    if self.verbose:
+                        line = self.enc.decode(tokens)
+                        print(repr(line))
+                    return tokens[0:length]
+        finally:
+            if self.lock:
+              self.lock.release()
