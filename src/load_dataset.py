@@ -29,8 +29,8 @@ def load_dataset(enc, path, combine):
                     token_chunks.append(npz[item])
         else:
             # Plain text
-            if fp.endswith('.gz'):
-                with gzip.open(fp, 'rb') as fp:
+            if path.endswith('.gz'):
+                with gzip.open(path, 'rt') as fp:
                     raw_text += fp.read()
             else:
                 with open(path, 'r') as fp:
