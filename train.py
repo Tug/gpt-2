@@ -119,13 +119,13 @@ parser.add_argument('--seed', type=int, default=-1, help='Deterministic seed for
 
 parser.add_argument('--save_graph', default=False, action='store_true', help="Save TensorFlow graph to summary log (to see ops in tensorboard)")
 
-PST = pytz.timezone('US/Pacific')
+CET = pytz.timezone('Europe/Paris')
 
 def timestamp(now=None, tz=None):
     if now is None:
         now = datetime.now(timezone.utc)
     if tz is None:
-        tz = PST
+        tz = CET
     return "{}".format(now.astimezone(tz).isoformat())
 
 def maketree(path):
