@@ -2,17 +2,43 @@ import tensorflow as tf
 import numpy as np
 from glob import glob
 import os
-import sys
 import re
 from tensorflow.python import pywrap_tensorflow
 import tqdm
 import h5py
 import shutil
 import tempfile
+import traceback
 import math
 
 from tensorflow.contrib import tpu
 from tensorflow.contrib.cluster_resolver import TPUClusterResolver
+from tensorflow.python.framework import dtypes
+
+import threading
+
+def parallelize(xs, thunk, *args):
+  threads = []
+  for x in xs:
+    thread = threading.Thread(target=thunk, args=(x, *args))
+    thread.start()
+    threads.append(thread)
+  return threads
+
+# http://stackoverflow.com/questions/1624883/alternative-way-to-split-a-list-into-groups-of-n
+import itertools
+def group(n, iterable, fillvalue=None):
+    "group(3, 'ABCDEFG', 'x') --> ABC DEF Gxx"
+    args = [iter(iterable)] * n
+    return itertools.zip_longest(*args, fillvalue=fillvalue)
+
+def tuples(*args, **kws):
+  return [x for x in group(*args, **kws)]
+
+class Namespace(object):
+  pass
+
+state = Namespace()
 
 def get_tpu_addr(tpu_name=None):
     # Get the TPU's location
@@ -26,23 +52,31 @@ def get_tpu_addr(tpu_name=None):
 def get_session_target(target='auto'):
     if target == 'auto':
       target = get_tpu_addr()
-      if target is not None:
-        print("Using TPU %s" % target)
+    elif target is not None:
+      target = get_tpu_addr(target)
+    if target is not None:
+      print("Using TPU %s" % target)
     return target
 
 class Session(tf.Session):
-  def __init__(self, target='auto', graph=None, config=None, init_tpu=False):
-    super().__init__(get_session_target(target), graph=graph, config=config)
-    self.init_tpu=init_tpu
+  def __init__(self, target='auto', graph=None, config=None):
+    target = get_session_target(target)
+    super().__init__(target, graph=graph, config=config)
+    self.target = target
+    self.config = config
 
-  def __enter__(self):
-    sess = super().__enter__()
-    if self.init_tpu:
-      print("Initializing TPU...")
-      sess.run(tpu.initialize_system())
-    return sess
+class MonitoredSession(tf.train.MonitoredSession):
+  def __init__(self, target='auto', graph=None, config=None):
+    target = get_session_target(target)
+    super().__init__(target, graph=graph, config=config)
+    self.target = target
+    self.config = config
 
-def split_by_params(vs, n=200e6, f=None):
+state.split_param_count = 1e4
+
+def split_by_params(vs, n=None, f=None):
+  if n is None:
+    n = state.split_param_count
   if f is None:
     f = lambda x: np.prod(x.shape.as_list())
   i = 0
@@ -91,20 +125,52 @@ def truncate_value(variable, value, reshape=True):
     value = value.reshape(shape)
   return value
 
+from tensorflow.core.protobuf import config_pb2
+
+def initialize_tpu(session=None, timeout_in_ms=None):
+  session = session or tf.get_default_session()
+  with session.as_default():
+    op = tpu.initialize_system()
+  options = None
+  if timeout_in_ms:
+    options=config_pb2.RunOptions(timeout_in_ms=timeout_in_ms)
+  return session.run(op, options=options)
+
+def load(variable, value, session=None, timeout_in_ms=None):
+  session = session or tf.get_default_session()
+  ops = variable.initializer
+  vals = dict([(variable.initializer.inputs[1], value)])
+  #for x, (k, v) in zip(variables, vals.items()):
+  #  print(x.name, x.shape.as_list(), k, v.shape)
+  options = None
+  if timeout_in_ms:
+    options=config_pb2.RunOptions(timeout_in_ms=timeout_in_ms)
+  return session.run(ops, vals, options=options)
+
+def eval(variable, session=None, timeout_in_ms=None):
+  session = session or tf.get_default_session()
+  options = None
+  if timeout_in_ms:
+    options=config_pb2.RunOptions(timeout_in_ms=timeout_in_ms)
+  return session.run(variable, options=options)
+
 def grab_values(variables, reader, reshape=False):
   for variable in variables:
-    name = variable.name.split(':')[0]
+    name = variable_name(variable).split(':')[0]
     value = reader.get_tensor(name)
     value = truncate_value(variable, value, reshape=reshape)
     yield variable, value
 
-def assign_values(variables, values, session=None):
+def assign_values(variables, values, session=None, timeout_in_ms=60000):
   session = session or tf.get_default_session()
   ops = [x.initializer for x in variables]
-  vals = dict([(x.initializer.inputs[1], value) for x, value in zip(variables, values)])
+  vals = dict([(x.initializer.inputs[1], value) for x, value in zip(variables, values)]) # TODO: bfloat16 support
   #for x, (k, v) in zip(variables, vals.items()):
   #  print(x.name, x.shape.as_list(), k, v.shape)
-  session.run(ops, vals)
+  options = None
+  if timeout_in_ms:
+    options=config_pb2.RunOptions(timeout_in_ms=timeout_in_ms)
+  session.run(ops, vals, options=options)
 
 def load_snapshot(ckpt, session=None, var_list=None, reshape=False):
   session = session or tf.get_default_session()
@@ -141,7 +207,7 @@ def load_variables(ckpt, session=None, var_list=None, reshape=False):
   vs = var_list or tf.trainable_variables()
   with h5py.File(ckpt, "r") as f:
     for variables in tqdm.tqdm(list(split_by_params(vs))):
-      values = [truncate_value(x, f[x.name], reshape=reshape)  for x in variables]
+      values = [truncate_value(x, f[variable_name(x)], reshape=reshape)  for x in variables]
       assign_values(variables, values, session=session)
 
 def maketree(path):
@@ -150,6 +216,35 @@ def maketree(path):
     except:
         pass
 
+state.cache_ops = {}
+
+def cast_variables(variables, graph=None, cache_ops=None):
+  if graph is None:
+    graph = tf.get_default_graph()
+  if cache_ops is None:
+    cache_ops = state.cache_ops
+  if graph not in cache_ops:
+    cache_ops[graph] = {}
+  cache = cache_ops[graph]
+  ops = []
+  for variable in variables:
+    if variable in cache:
+      op = cache[variable]
+    elif variable.dtype == dtypes.bfloat16_ref or variable.dtype == tf.bfloat16:
+      op = tf.cast(variable, tf.float32)
+    else:
+      op = variable
+    cache[variable] = op
+    ops.append(op)
+  return ops
+
+import re
+
+def variable_name(variable):
+  if re.match(r'core[0-9]+/', variable.name):
+    return variable.name.split('/', 1)[-1]
+  return variable.name
+
 def save_variables(ckpt, session=None, var_list=None):
     session = session or tf.get_default_session()
     vs = var_list or tf.trainable_variables()
@@ -157,15 +252,29 @@ def save_variables(ckpt, session=None, var_list=None):
     fname = ckpt+'.tmp'
     with h5py.File(fname, "w") as f:
       for variables in tqdm.tqdm(list(split_by_params(vs))):
-        values = session.run(variables)
+        ops = cast_variables(variables)
+        values = session.run(ops)
         for value, variable in zip(values, variables):
-          name = variable.name
+          name = variable_name(variable)
           shape = variable.shape.as_list()
           dtype = variable.dtype
           dset = f.create_dataset(name, shape, dtype=np.float32)
           dset[:] = value
     print('Writing snapshot %s' % ckpt)
     os.rename(ckpt+'.tmp', ckpt)
+
+def fetch_variables(session=None, var_list=None):
+    session = session or tf.get_default_session()
+    vs = var_list or tf.trainable_variables()
+    for variables in tqdm.tqdm(list(split_by_params(vs))):
+      values = session.run(variables)
+      yield variables, values
+
+def partition_variables(session=None, var_list=None):
+    session = session or tf.get_default_session()
+    vs = var_list or tf.trainable_variables()
+    for variables in tqdm.tqdm(list(split_by_params(vs))):
+      yield variables
 
 class Saver(object):
   def __init__(
@@ -203,7 +312,7 @@ class Saver(object):
     self.checkpoints = []
 
   def restore(self, sess, save_path):
-    if save_path.endswith('.ckpt') or os.path.isfile(save_path + '.data-00000-of-00001'):
+    if save_path.endswith('.ckpt'):
       load_snapshot(save_path, session=sess, var_list=self.var_list, reshape=self.reshape)
     elif save_path.endswith('.hdf5'):
       load_variables(save_path, session=sess, var_list=self.var_list, reshape=self.reshape)
@@ -241,6 +350,21 @@ class Saver(object):
           except:
             print('Failed to truncate %s' % fname)
         self.checkpoints = self.checkpoints[1:]
+
+  def fetch(self, sess, var_list=None):
+    if var_list == None:
+      var_list = self.var_list
+    for variables, values in fetch_variables(session=sess, var_list=var_list):
+      yield variables, values
+
+  def variables(self, sess, var_list=None):
+    if var_list == None:
+      var_list = self.var_list
+    for variables in partition_variables(session=sess, var_list=var_list):
+      yield variables
+
+  def assign(self, sess, variables, values):
+    return assign_values(variables, values, session=sess)
 
 class Commands(object):
   def __init__(self, path='commands'):
@@ -342,13 +466,19 @@ class CommandArgs(object):
     self.cmdr.keys = self.keys_prev
 
 def check_commands():
-  cmdr = commands()
-  return cmdr.check()
+  try:
+    cmdr = commands()
+    return cmdr.check()
+  except:
+    traceback.print_exc()
 
 def check_commands_with_args(*args, **keys):
-  cmdr = commands()
-  with CommandArgs(*args, **keys):
-    return cmdr.check()
+  try:
+    cmdr = commands()
+    with CommandArgs(*args, **keys):
+      return cmdr.check()
+  except:
+    traceback.print_exc()
 
 def add_command(name, action=None, **keys):
   cmdr = commands()
@@ -422,7 +552,11 @@ def utc():
     import calendar
     return calendar.timegm(d.utctimetuple())
 
+state.no_heartbeat = True
+
 def heartbeat():
+  if state.no_heartbeat:
+    return
   pongfile=os.environ['PONG'] if 'PONG' in os.environ else 'pong.txt'
   with open(pongfile, "a+") as f:
     nonce = os.urandom(8).hex()
@@ -456,25 +590,26 @@ def freeze_forever():
 _quit = False
 
 import sys
+import posix
+
+state.quit_immediately = True
 
 @register_command
 def quit():
   global _quit
-  if _quit:
-    print("Failed to quit; running sys.exit(1)")
-    sys.exit(1)
+  if _quit or state.quit_immediately:
+    posix._exit(1)
   else:
-    print("Quitting...")
     _quit = True
+
+@register_command
+def quit_immediately():
+  posix._exit(1)
 
 def should_quit():
   return _quit
 
 @register_command
-def save_and_quit():
-  global _quit
-  if has_command('save'):
-    print("Saving...")
-    run_command('save')
-  quit()
+def throw_exception():
+  raise Exception("This exception should be caught and logged by the tflex command system")
 
