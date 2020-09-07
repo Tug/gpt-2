@@ -48,7 +48,7 @@ class Encoder:
         self.byte_decoder = {v:k for k, v in self.byte_encoder.items()}
         self.bpe_ranks = dict(zip(bpe_merges, range(len(bpe_merges))))
         self.cache = {}
-
+        
         self.pat = re.compile(r""" ?j['|’]| ?t['|’]| ?s['|’]| ?c['|’]| ?m['|’]| ?n['|’]| ?l['|’]| ?d['|’]| ?qu['|’]| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
 
     def bpe(self, token):
@@ -164,17 +164,58 @@ class HighSpeedTokenizer(object):
     text = self.tokenizer.decode(tokens, False)
     return text
 
-def get_encoder(model_name):
-    vocab_path = os.path.join('models', model_name, 'encoder.json')
-    bpe_merges_path = os.path.join('models', model_name, 'vocab.bpe')
-    if use_high_speed_tokenizer:
-      return HighSpeedTokenizer(vocab_path=vocab_path, bpe_merges_path=bpe_merges_path)
-    with open(vocab_path, 'r') as f:
-        encoder = json.load(f)
-    with open(bpe_merges_path, 'r', encoding="utf-8") as f:
-        bpe_data = f.read()
-    bpe_merges = [tuple(merge_str.split()) for merge_str in bpe_data.split('\n')[1:-1]]
-    return Encoder(
-        encoder=encoder,
-        bpe_merges=bpe_merges,
-    )
+def read_bucket(path, mode='rb'):
+  if os.path.isfile(path):
+    with open(path, mode) as f:
+      return f.read()
+  else:
+    import tensorflow as tf
+    with tf.io.gfile.GFile(path, mode=mode) as f:
+      return f.read()
+
+import tempfile
+from contextlib import contextmanager
+
+@contextmanager
+def bucket_file(path):
+  if os.path.isfile(path):
+    with open(path, "rb") as f:
+      data = f.read()
+    yield path, data
+  else:
+    data = read_bucket(path)
+    with tempfile.NamedTemporaryFile() as tmp:
+      tmp.write(data)
+      tmp.seek(0)
+      yield tmp.name, data
+
+def bucket_path(path, *parts):
+  if len(parts) <= 0:
+    return path
+  if path.startswith('gs://'):
+    sep = '/'
+  else:
+    sep = os.sep
+  if not path.endswith(sep):
+    path = path + sep
+  path = path + parts[0]
+  return bucket_path(path, *parts[1:])
+
+def get_encoder(model_path=None):
+  if model_path is None:
+    #model_path = 'gs://gpt-2/models/117M/'
+    model_path = os.path.dirname(__file__)
+  with bucket_file(bucket_path(model_path, 'encoder.json')) as (vocab_path, vocab_data):
+    with bucket_file(bucket_path(model_path, 'vocab.bpe')) as (bpe_merges_path, bpe_data):
+      encoder = json.loads(vocab_data.decode('utf8'))
+      if use_high_speed_tokenizer:
+        tokenizer = HighSpeedTokenizer(vocab_path=vocab_path, bpe_merges_path=bpe_merges_path)
+        tokenizer.encoder = encoder
+        return tokenizer
+      bpe_data = bpe_data.decode('utf8')
+      bpe_merges = [tuple(merge_str.split()) for merge_str in bpe_data.split('\n')[1:-1]]
+      return Encoder(
+          encoder=encoder,
+          bpe_merges=bpe_merges,
+      )
+
