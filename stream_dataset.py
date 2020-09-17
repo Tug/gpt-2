@@ -20,7 +20,7 @@ import tflex_utils
 parser = argparse.ArgumentParser(
     description='Pre-encode text files into tokenized training set.',
     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-parser.add_argument('--model_name', metavar='MODEL', type=str, default='117M', help='Pretrained model name')
+parser.add_argument('--vocab', metavar='VOCAB', type=str, default='vocab-fr', help='Vocab uri')
 parser.add_argument('--combine', metavar='chars', type=int, default=50000, help='concatenate files with <|endoftext|> separator into chunks of this minimum size')
 parser.add_argument('--append', action='store_true', help='append to the output file?')
 parser.add_argument('--reopen_every', type=float, default=1.0, help='Reopen output file every N seconds')
@@ -35,7 +35,7 @@ def nullcontext(enter_result=None):
 
 def main():
     args = parser.parse_args()
-    enc = encoder.get_encoder(args.model_name)
+    enc = encoder.get_encoder('vocab-fr')
     chunks = load_dataset(enc, args.in_npz, args.combine) if args.in_npz.endswith('.npz') else args.in_npz
     streamer = TokenStreamer(chunks, enc=enc)
     text_mode = not isinstance(chunks, list)
